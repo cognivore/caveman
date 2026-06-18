@@ -21,12 +21,22 @@ the real shipped behavior file, nothing hand-copied.
 Tasks are the first N items (deterministic) of established eval libraries, pulled by
 `scripts/fetch_evals.py` (HuggingFace datasets-server, no auth) into `data/tasks.json`:
 
-| suite | domain | source | grading |
-|---|---|---|---|
-| `aime` | math | AI-MO AIME (competition, integer answers) | numeric |
-| `math5` | math | Hendrycks MATH **level 5** (hardest tier) | exact (normalized LaTeX, approximate) |
-| `mmlu_pro_cs` | cs | MMLU-Pro computer science (10-option reasoning MC) | letter |
-| `humaneval` | cs | OpenAI HumanEval (code) | **execution** (assemble + run unit test) |
+| suite | domain | source | grading | gated |
+|---|---|---|---|:--:|
+| `aime` | math | AI-MO AIME (competition, integer answers) | numeric | |
+| `math5` | math | Hendrycks MATH **level 5** (hardest tier) | exact (normalized LaTeX, approximate) | |
+| `math500` | math | HuggingFaceH4 MATH-500 | exact (approximate) | |
+| `aime25` | math | math-ai AIME 2025 (fresh, integer answers) | numeric | |
+| `mmlu_pro_cs` | cs | MMLU-Pro computer science (10-option reasoning MC) | letter | |
+| `humaneval` | cs | OpenAI HumanEval (code) | **execution** (assemble + run unit test) | |
+| `gpqa_diamond` | sci | GPQA Diamond (graduate science MC, options deterministically sorted) | letter | ✅ |
+| `hle` | any | Humanity's Last Exam (text-only items) | letter / exact (approximate) | ✅ |
+
+Gated repos (GPQA, HLE) need a HuggingFace token. It is read at runtime via
+`rageveil show huggingface.co/doma@doma.dev/Big_Token_Doma`, sent as a Bearer header to
+the datasets-server, and never written to disk. **Raw dataset rows are never committed** —
+`data/tasks.json` is gitignored; only derived metrics (`data/samples.json`) and the
+generated `REPORT.md` land in git.
 
 ## Run
 
