@@ -142,6 +142,7 @@ fn grade(t: &Task, answer: &str) -> bool {
         "letter"  => first_choice(answer).map_or(false, |c| c == t.gold),
         "exact"   => { let (a, g) = (norm_math(answer), norm_math(&t.gold)); !g.is_empty() && (a == g || a.contains(&g)) },
         "code"    => grade_code(answer, &t.test, &t.entry),
+        "stdio"   => grade_stdio(answer, &t.test),
         _ => false,
     }
 }
@@ -186,6 +187,36 @@ fn grade_code(answer: &str, test: &str, entry: &str) -> bool {
     ok
 }
 fn strip_fences(s: &str) -> String { s.lines().filter(|l| !l.trim_start().starts_with("```")).collect::<Vec<_>>().join("\n") }
+fn norm_out(s: &str) -> String { s.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n").trim_end().to_string() }
+fn io_str(v: &Value) -> String {
+    match v { Value::String(s) => s.clone(), Value::Array(a) => a.iter().map(io_str).collect::<Vec<_>>().join("\n"), other => other.to_string() }
+}
+// APPS-style: run candidate program on each stdin, compare normalized stdout. All must pass.
+fn grade_stdio(answer: &str, tests_json: &str) -> bool {
+    let code = strip_fences(answer);
+    if code.trim().is_empty() { return false; }
+    let v: Value = match serde_json::from_str(tests_json) { Ok(v) => v, Err(_) => return false };
+    let ins = v["inputs"].as_array().cloned().unwrap_or_default();
+    let outs = v["outputs"].as_array().cloned().unwrap_or_default();
+    if ins.is_empty() { return false; }
+    let path = std::env::temp_dir().join(format!("skillbench_apps_{}.py", CTR.fetch_add(1, Ordering::SeqCst)));
+    if std::fs::write(&path, &code).is_err() { return false; }
+    let mut ok = true;
+    for (i, inp) in ins.iter().enumerate() {
+        let stdin_s = io_str(inp);
+        let exp = norm_out(&outs.get(i).map(io_str).unwrap_or_default());
+        let mut child = match Command::new("python3").arg(&path)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() { Ok(c) => c, Err(_) => { ok = false; break; } };
+        if let Some(mut si) = child.stdin.take() { let s = stdin_s.clone(); std::thread::spawn(move || { let _ = si.write_all(s.as_bytes()); }); }
+        let mut finished = false;
+        for _ in 0..120 { match child.try_wait() { Ok(Some(_)) => { finished = true; break; } Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)), Err(_) => break } }
+        if !finished { let _ = child.kill(); ok = false; break; }
+        let got = child.wait_with_output().map(|o| norm_out(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default();
+        if got != exp { ok = false; break; }
+    }
+    let _ = std::fs::remove_file(&path);
+    ok
+}
 
 // ---- samples + algorithm -------------------------------------------------
 #[derive(Clone)]
@@ -207,6 +238,10 @@ fn run_benchmark<T: Llm>(llm: &T, tasks: &[Task], arms: &[&str], skill: &str, re
 }
 
 fn median(v: &[i64]) -> f64 { let mut v = v.to_vec(); v.sort(); let n = v.len(); if n == 0 { 0.0 } else if n%2==1 { v[n/2] as f64 } else { (v[n/2-1]+v[n/2]) as f64/2.0 } }
+fn mean(v: &[i64]) -> f64 { if v.is_empty() { 0.0 } else { v.iter().sum::<i64>() as f64 / v.len() as f64 } }
+fn task_ids(s: &[Sample]) -> Vec<(String, String)> { let mut o: Vec<(String,String)> = vec![]; for x in s { if !o.iter().any(|(i,_)| i==&x.id) { o.push((x.id.clone(), x.suite.clone())); } } o }
+fn t_think(s: &[Sample], id: &str, arm: &str) -> Vec<i64> { s.iter().filter(|x| x.id==id && x.arm==arm).map(|x| x.thinking).collect() }
+fn t_acc(s: &[Sample], id: &str, arm: &str) -> (usize, usize) { let v: Vec<&Sample> = s.iter().filter(|x| x.id==id && x.arm==arm).collect(); (v.iter().filter(|x| x.correct).count(), v.len()) }
 fn arm_out(s: &[Sample], arm: &str) -> Vec<i64> { s.iter().filter(|x| x.arm==arm).map(|x| x.output).collect() }
 fn arm_think(s: &[Sample], arm: &str) -> Vec<i64> { s.iter().filter(|x| x.arm==arm).map(|x| x.thinking).collect() }
 fn arm_suite_out(s: &[Sample], arm: &str, suite: &str) -> Vec<i64> { s.iter().filter(|x| x.arm==arm && x.suite==suite).map(|x| x.output).collect() }
@@ -275,6 +310,40 @@ fn build_report(samples: &[Sample], reps: usize) -> String {
         r.push('\n');
     }
     r.push('\n');
+
+    // poison-thinking check: on tasks where baseline genuinely reasons, does caveman
+    // cut billed thinking, and does accuracy survive? (cut thinking + dropped accuracy = poison)
+    let active: Vec<(String, String)> = task_ids(samples).into_iter()
+        .filter(|(id,_)| mean(&t_think(samples, id, "baseline")) >= 20.0).collect();
+    r.push_str("## Does caveman poison thinking?\n\n");
+    if active.is_empty() {
+        r.push_str("No task had baseline mean thinking ≥ 20 — nothing reasoned hard enough to test. Add harder items.\n\n");
+    } else {
+        r.push_str(&format!("Restricted to the **{} tasks the baseline actually reasons through** (mean baseline thinking ≥ 20). If caveman cuts thinking here *and* loses accuracy, the terseness instruction is bleeding into private reasoning.\n\n", active.len()));
+        r.push_str("| task | suite | base think | cave think | Δ think | base acc | cave acc |\n|---|---|--:|--:|--:|:--:|:--:|\n");
+        let (mut bsum, mut csum) = (0.0_f64, 0.0_f64);
+        let (mut bc, mut bn, mut cc, mut cn) = (0usize, 0usize, 0usize, 0usize);
+        for (id, su) in &active {
+            let bt = mean(&t_think(samples, id, "baseline"));
+            let ct = mean(&t_think(samples, id, "caveman"));
+            let d = if bt > 0.0 { (ct - bt) / bt * 100.0 } else { 0.0 };
+            let (ba, bnn) = t_acc(samples, id, "baseline");
+            let (ca, cnn) = t_acc(samples, id, "caveman");
+            bsum += bt; csum += ct; bc += ba; bn += bnn; cc += ca; cn += cnn;
+            r.push_str(&format!("| `{}` | {} | {:.0} | {:.0} | {:+.0}% | {}/{} | {}/{} |\n", id, su, bt, ct, d, ba, bnn, ca, cnn));
+        }
+        let dsum = if bsum > 0.0 { (csum - bsum) / bsum * 100.0 } else { 0.0 };
+        r.push_str(&format!("| **{} active** | | **{:.0}** | **{:.0}** | **{:+.0}%** | **{}/{}** | **{}/{}** |\n\n", active.len(), bsum, csum, dsum, bc, bn, cc, cn));
+        let acc_drop = (bc as f64 / bn.max(1) as f64) - (cc as f64 / cn.max(1) as f64);
+        let verdict = if dsum <= -15.0 && acc_drop > 0.10 {
+            "**Poison signal:** caveman cut billed thinking on reasoning-active tasks AND lost accuracy there — the terseness is leaking into private reasoning."
+        } else if dsum <= -15.0 {
+            "Caveman cut billed thinking on reasoning-active tasks but accuracy held — compression without measurable poison (on this small sample)."
+        } else {
+            "No poison signal: caveman did not systematically cut billed thinking on reasoning-active tasks."
+        };
+        r.push_str(verdict); r.push_str("\n\n");
+    }
 
     // verdict
     r.push_str("## Verdict\n\n");

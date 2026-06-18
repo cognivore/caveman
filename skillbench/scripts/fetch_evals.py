@@ -110,6 +110,22 @@ def humaneval():
                       "instruction": "Complete the function. Output only the full Python function definition (including the signature), no markdown fences, no commentary.",
                       "prompt": r["prompt"], "gold": "", "test": r["test"], "entry_point": r["entry_point"]})
 
+def apps():
+    # hard competition coding, executed on stdin/stdout. interview tier, stdio-graded only.
+    def ok(r):
+        io = r.get("input_output") or ""
+        if not io: return False
+        try: d = json.loads(io)
+        except Exception: return False
+        return "fn_name" not in d and d.get("inputs") and d.get("outputs")
+    for i, r in enumerate(paged("codeparrot/apps", "all", "test", N,
+                                lambda r: r.get("difficulty") == "interview" and ok(r))):
+        d = json.loads(r["input_output"])
+        cases = {"inputs": d["inputs"][:6], "outputs": d["outputs"][:6]}
+        tasks.append({"suite": "apps", "domain": "cs", "id": f"apps-{i}", "kind": "stdio",
+                      "instruction": "Write a complete Python 3 program that reads from standard input and writes the answer to standard output. Output only the program — no markdown fences, no commentary.",
+                      "prompt": r["question"], "gold": "", "test": json.dumps(cases)})
+
 def gpqa():
     # gated. Deterministic option order (sorted by text) so position isn't a tell.
     for i, r in enumerate(rows("Idavidrein/gpqa", "gpqa_diamond", "train", 0, N)):
@@ -144,6 +160,7 @@ add(math500, "math500")
 add(aime25, "aime25")
 add(mmlu_pro_cs, "mmlu_pro_cs")
 add(humaneval, "humaneval")
+add(apps, "apps (hard coding, executed)")
 add(gpqa, "gpqa_diamond [gated]")
 add(hle, "hle [gated]")
 
